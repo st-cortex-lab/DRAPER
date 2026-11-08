@@ -6,16 +6,22 @@ from rclpy.node import Node
 import numpy as np
 import cv2
 import json
+import threading
 
 from rcc_msgs.msg import NormPixelPnP, Observation, Reset, WorldPnP
 from std_msgs.msg import Header
 from cv_bridge import CvBridge
 
-from utils import *
+
+from .utils import *
 
 class ControlInterface(Node):
     def __init__(self, task, steps=20, name='control_interface',
-                 adjust_pick=False, adjust_orien=False, video_device='/dev/video6', save_dir='.'):
+                 adjust_pick=False, adjust_orien=False, 
+                 video_device='/dev/video6', debug=False,
+                 success_check_fn=(lambda state: False), 
+                 human_success_judgement=True,
+                 save_dir='.'):
         super().__init__(f"{name}_interface")
         self.img_sub = self.create_subscription(Observation, '/observation', self.img_callback, 10)
         self.pnp_pub = self.create_publisher(NormPixelPnP, '/norm_pixel_pnp', 10)
@@ -25,6 +31,10 @@ class ControlInterface(Node):
         self.mask_generator = get_mask_generator()
         self.task = task
         self.save_dir = save_dir
+        self.debug = debug
+        self.human_success_judgement = human_success_judgement
+        self.success_check_fn = success_check_fn
+        os.makedirs(self.save_dir, exist_ok=True)
       
         self.step = -1
         self.last_action = None
@@ -33,13 +43,12 @@ class ControlInterface(Node):
         self.adjust_orient = adjust_orien
         self.video_device = video_device
         self.video_process = None
-
         if 'folding' in task:
             self.collect_demo = False
             self.demo_states = []
         #self.estimate_pick_depth = estimate_pick_dpeth
 
-        print('Finish Init Control Interface')
+        print('Finish Initialising Control Interface')
 
     def publish_action(self, pnp):
         data = pnp['pick-and-place'] #.reshape(4)
@@ -59,28 +68,114 @@ class ControlInterface(Node):
         header = Header()
         header.stamp = self.get_clock().now().to_msg()
         self.reset_pub.publish(header)
-        print('Published reset!')
+        if self.debug:
+            print('Published reset!')
 
     def _save_step(self, state, save_dir):
         rgb = state['observation']['rgb']
-        raw_rgb = state['observation']['raw_rgb']
-        full_mask = state['observation']['full_mask']
+        
+        
         depth = state['observation']['depth']
         mask = state['observation']['mask']
+        
 
         os.makedirs(save_dir, exist_ok=True)
-        print('rgb shape', rgb.shape)
+        # print('rgb shape', rgb.shape)
         save_color(rgb, filename='rgb', directory=save_dir)
-        save_color(raw_rgb, filename='raw_rgb', directory=save_dir)
+        
         save_depth(depth, filename='depth', directory=save_dir)
         save_depth(depth, filename='colour_depth', directory=save_dir, colour=True)
         save_mask(mask, filename='mask', directory=save_dir)
-        save_mask(full_mask, filename='full_mask', directory=save_dir)
+        
+        if 'full_mask' in state['observation']:
+            full_mask = state['observation']['full_mask']
+            save_mask(full_mask, filename='full_mask', directory=save_dir)
+
+        if 'mask_v2' in state['observation']:
+            mask_v2 = state['observation']['mask_v2']
+            save_mask(mask_v2, filename='mask_v2', directory=save_dir)
+        
+        if 'mask_v1' in state['observation']:
+            mask_v1 = state['observation']['mask_v1']
+            save_mask(mask_v1, filename='mask_v1', directory=save_dir)
+        
+        if 'mask_v0' in state['observation']:
+            mask_v0 = state['observation']['mask_v0']
+            save_mask(mask_v0, filename='mask_v0', directory=save_dir)
+
+        if 'raw_rgb' in state['observation']:
+            raw_rgb = state['observation']['raw_rgb']
+            save_color(raw_rgb, filename='raw_rgb', directory=save_dir)
+        
+        if 'workspace_mask' in state['observation']:
+            workspace_mask = state['observation']['workspace_mask'][:, :, None]
+            rgb = state['observation']['rgb']
+
+            alpha = 0.3
+            rgb = rgb.astype(np.float32)/255
+            rgb = rgb*workspace_mask + alpha*rgb*(1-workspace_mask)
+            rgb = (rgb * 255).astype(np.uint8)
+            save_color(rgb, filename='workspace_rgb', directory=save_dir)
+
+        if self.debug:
+            print('state', state.keys())
+
+        if 'input_obs' in state:
+            input_obs = state['input_obs']
+            input_type = state['input_type']
+            if self.debug:
+                print('input_obs', input_obs.shape)
+            if input_type == 'rgb':
+                input_obs = (input_obs * 255).clip(0, 255).astype(np.uint8)
+                save_color(input_obs, filename='input_obs_rgb', directory=save_dir)
+            elif input_type == 'depth':
+                if self.debug:
+                    print('max depth', np.max(input_obs))
+                    print('min depth', np.min(input_obs))
+                ## save a plot for the distribution of the depth
+                save_depth_distribution(input_obs, filename='input_obs_depth_distribution', directory=save_dir)
+
+                save_depth(input_obs, filename='input_obs_depth', directory=save_dir, remap=False)
+                save_depth(input_obs, filename='input_obs_colour_depth', directory=save_dir, colour=True, remap=False)
+            elif input_type == 'rgbd':
+                if self.debug:
+                    print('input_obs', input_obs.shape)
+                rgb = input_obs[:, :, :3].copy().clip(0, 255).astype(np.uint8)
+                save_color(rgb, filename='input_obs_rgb', directory=save_dir)
+                save_depth(input_obs[:, :, 3], filename='input_obs_depth', directory=save_dir)
+                save_depth(input_obs[:, :, 3], filename='input_obs_colour_depth', directory=save_dir, colour=True)
+        
+        if 'denoise_action_input_obs_rgb' in state:
+            denoise_action_input_obs_rgb = state['denoise_action_input_obs_rgb']
+            save_color(denoise_action_input_obs_rgb, filename='denoise_action_input_obs_rgb', directory=save_dir)
+        
+        if 'denoise_action_rgb' in state:
+            denoise_action_rgb = state['denoise_action_rgb']
+            save_color(denoise_action_rgb, filename='denoise_action_rgb', directory=save_dir)
+
+        if 'grasp_image' in state:
+            grasp_image = state['grasp_image']
+            save_color(grasp_image, filename='grasp_image', directory=save_dir)
+
+        if 'action_obs_rgb' in state:
+            action_obs_rgb = state['action_obs_rgb']
+            save_color(action_obs_rgb, filename='action_obs_rgb', directory=save_dir)
+        
+        if 'noise_actions_obs_depth' in state:
+            noise_actions_obs_depth = state['noise_actions_obs_depth']
+            save_color(noise_actions_obs_depth, filename='noise_actions_obs_depth', directory=save_dir)
+
+        if 'denoise_depth_frames' in state:
+            from agent_arena.utilities.visual_utils import save_numpy_as_gif
+            file_dir = os.path.join(save_dir, 'denoise_depth_frames')
+            save_numpy_as_gif(state['denoise_depth_frames'], file_dir)
+            #save_frames(, directory=save_dir, filename='denoise_depth_frames')
 
         if 'action' in state:
             action = state['action']
             action_image = state['action_image']
-            print('action image', action_image.shape)
+            if self.debug:
+                print('action image', action_image.shape)
             save_color(action_image, filename='action_image', directory=save_dir)
             # cv2.imwrite(f'{save_dir}/action_image.png', action_image)
             with open(f'{save_dir}/action.json', "w") as json_file:
@@ -97,45 +192,72 @@ class ControlInterface(Node):
         #color_depth = cv2.applyColorMap(np.uint8(255 * depth), cv2.COLORMAP_AUTUMN)
         save_dir = os.path.join(self.save_dir, self.trj_name, f'step_{str(self.step)}')
 
-        self._save_step(state, save_dir)
+        #self._save_step(state, save_dir)
+
+        # Define a target function for the thread
+        def background_save():
+            self._save_step(state, save_dir)
+
+        # Start the background thread
+        thread = threading.Thread(target=background_save)
+        thread.daemon = True  # Optional: dies with the program
+        thread.start()
         
 
-    def evaluate(self, state):
+    def evaluate(self, state): ## TODO: we can call this function as parallel.
         if self.task == 'flattening':
             current_mask = state['observation']['full_mask']
             cur_mask_pixels = int(np.sum(current_mask))
-            print('current_mask', cur_mask_pixels)
+            if self.debug:
+                print('current_mask', cur_mask_pixels)
 
             if self.step == 0:
                 self.init_mask_pixels = cur_mask_pixels
+            
+            cur_mask = extract_square_crop_mask(state['observation']['mask'])
+            goal_mask = extract_square_crop_mask(self.goal_mask)
+            if self.debug:
+                save_mask(cur_mask, filename='current_mask_iou', directory='tmp')
+                save_mask(goal_mask, filename='goal_mask_iou', directory='tmp')
+            max_IoU, _ = get_max_IoU(cur_mask, goal_mask)
+            nc =  max(min(1.0, 1.0 * cur_mask_pixels/self.max_mask_pixels), 0)
 
             res = {
                 'max_coverage': self.max_mask_pixels,
                 'init_coverage': self.init_mask_pixels,
                 'coverage': cur_mask_pixels,
-                'normalised_coverage': 1.0 * cur_mask_pixels/self.max_mask_pixels,
+                'normalised_coverage': nc,
                 'normalised_improvement': max(min(1.0*(cur_mask_pixels - self.init_mask_pixels)\
                                                 /(self.max_mask_pixels - self.init_mask_pixels), 1), 0),
-                'auto success': bool(1.0 * cur_mask_pixels/self.max_mask_pixels > 0.95),
+                'max_IoU': max_IoU,
+                
                 'human success': False
             }
 
+            res['auto success'] = bool(self.success_check_fn(res)) #bool(1.0 * cur_mask_pixels/self.max_mask_pixels
+            
             return res
         elif 'folding' in self.task:
             IoU, matched_mask = get_IoU(state['observation']['mask'], self.goal_mask)
-            save_mask(matched_mask, filename='matched_mask', directory='tmp')
+            if self.debug:
+                save_mask(matched_mask, filename='matched_mask', directory='tmp')
             return {
                 'human success': False, 
-                'auto success': bool(IoU > 0.9),
+                'auto success': self.success_check_fn(state), #bool(IoU > 0.9),
                 'IoU': IoU}
     
     def setup_evaluation(self, state):
         if self.task == 'flattening':
-            current_mask = state['observation']['mask']
+            current_mask = state['observation']['full_mask']
             self.max_mask_pixels = int(np.sum(current_mask))
             save_dir = os.path.join(self.save_dir, self.trj_name, 'goals', f'step_0')
             self._save_step(state, save_dir)
+            self.goal_mask = state['observation']['mask']
+            self.goal_rgb = state['observation']['rgb']
+            self.goal_depth = state['observation']['depth']
+
             
+                
         elif 'folding' in self.task:
             self.demo_states.append(state)
         
@@ -162,6 +284,7 @@ class ControlInterface(Node):
                     self._save_step(state, save_dir)
                 
                 self.goal_mask = self.demo_states[-1]['observation']['mask']
+                self.goal_rgb = self.demo_states[-1]['observation']['rgb']
         
         self.setup_init_state()
         self.start_video()
@@ -171,42 +294,54 @@ class ControlInterface(Node):
         is_continue = input('[User Attention!] Please set a random initial state, and enter any keys after setup to continue!')
         
 
-    def clean_up(self, state):
+    def end_trial(self, state):
         self.stop_video()
 
-        while True:
-            is_success = input('[User Attention!] Is the task successful? (y/n): ')
-            if is_success == 'y':
-                state['evaluation']['human success'] = True
-                break
-            elif is_success == 'n':
-                state['evaluation']['human success'] = False
-                break
-            else:
-                print('[User Attention!] Invalid input')
-                continue
+        if self.human_success_judgement:
+            while True:
+                is_success = input('[User Attention!] Is the task successful? (y/n): ')
+                if is_success == 'y':
+                    state['evaluation']['human success'] = True
+                    break
+                elif is_success == 'n':
+                    state['evaluation']['human success'] = False
+                    break
+                else:
+                    print('[User Attention!] Invalid input')
+                    continue
         self.save_step(state)
         self.reset()
 
     def img_callback(self, data):
-        print('Receive observation data')
+        if self.debug:
+            print('Receive observation data')
         crop_rgb = imgmsg_to_cv2_custom(data.crop_rgb, "bgr8")
         crop_depth = imgmsg_to_cv2_custom(data.crop_depth, "64FC1")
         raw_rgb = imgmsg_to_cv2_custom(data.raw_rgb, "bgr8")
+        workspace = imgmsg_to_cv2_custom(data.workspace_mask, "mono8")
         self.real_camera_height = data.camera_height
-        input_state = self.post_process(crop_rgb, crop_depth, raw_rgb)
+        input_state = self.post_process(crop_rgb, crop_depth, workspace, raw_rgb)
 
         if self.step == -1:
             self.step += 1
             self.setup_evaluation(input_state)
             
             return
+        
+        input_state['goal'] = {
+            'rgb': self.goal_rgb.copy(),
+            'mask': self.goal_mask.copy(),
+            'depth': self.goal_depth.copy(),
+        }
+
+        for k, v in input_state['goal'].items():
+            input_state['observation'][f"goal-{k}"] = v
 
         evaluation = self.evaluate(input_state)
 
         input_state['evaluation'] = evaluation
 
-        done = (self.step >= self.fix_steps)
+        done = (self.step >= self.fix_steps) or self.success_check_fn(input_state['evaluation'])
 
         
         if wait_for_user_input():
@@ -214,7 +349,7 @@ class ControlInterface(Node):
             done = True
 
         if done:
-            self.clean_up(input_state)
+            self.end_trial(input_state)
             return
         elif self.step == 0:
             self.init(input_state)
@@ -230,13 +365,15 @@ class ControlInterface(Node):
 
         self.last_action = action
         pick_and_place = action['pick-and-place']
-        pixel_actions = ((pick_and_place + 1) / 2 * self.resolution[0]).astype(int).reshape(4)
+        H, W, _ = save_state['observation']['rgb'].shape
+        pixel_actions = ((pick_and_place.reshape(-1, 2) + 1) / 2 * np.asarray([W, H])).astype(int).reshape(4)
         action_image = draw_pick_and_place(
             save_state['observation']['rgb'],
             tuple(pixel_actions[:2]),
             tuple(pixel_actions[2:]),
-            color=(0, 255, 0)
-        ).astype(np.uint8)
+            color=(137,243,54),
+            swap=True,
+        ).get().astype(np.uint8)
         action['pick-and-place'] = action['pick-and-place'].reshape(4).tolist()
         #print('save actio', action)
         save_state['action'] = action
@@ -325,5 +462,5 @@ class ControlInterface(Node):
         self.reset()
         rclpy.spin(self)
 
-    def post_process(self, rgb, depth, raw_rgb=None, pointcloud=None):
+    def post_process(self, rgb, depth, workspace, raw_rgb=None, pointcloud=None):
         pass

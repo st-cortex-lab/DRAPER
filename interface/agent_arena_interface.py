@@ -18,56 +18,42 @@ import agent_arena as agar
 
 from rcc_msgs.msg import NormPixelPnP, Observation
 from std_msgs.msg import Header
-from agent_arena.utilities.visualisation_utils import *
+from agent_arena.utilities.visual_utils import *
 
 import argparse
 from cv_bridge import CvBridge, CvBridgeError
-from utils import *
-from control_interface import ControlInterface
+from .utils import *
+from .control_interface import ControlInterface
 
 
 class AgentArenaInterface(ControlInterface):
-    def __init__(self, agent, task, config_name, 
-                 checkpoint,
-                 steps=20, 
-                 adjust_pick=False, 
-                 adjust_orien=False,
+    def __init__(self, agent, 
+                 #config_name, 
+                 #checkpoint,
                  depth_sim2real='v2',
                  mask_sim2real='v2',
                  sim_camera_height=0.65,
-                 save_dir='.'):
-        super().__init__(task, steps=steps, adjust_pick=adjust_pick, 
-                         name='agent', adjust_orien=adjust_orien, save_dir=save_dir)
-
+                 callback_on_internal_states=None,
+                 whole_workspace=False,
+                 goal_conditioned=False,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.goal_conditioned = goal_conditioned    
         self.agent = agent
-        # print('Max steps {}'.format(steps))
-        #  ### Initialise Ros
-        # self.img_sub = self.create_subscription(Observation, '/observation', self.img_callback, 10)
-        # self.pnp_pub = self.create_publisher(NormPixelPnP, '/norm_pixel_pnp', 10)
-        # self.reset_pub = self.create_publisher(Header, '/reset', 10)
-
-        #self.task = task
-        # self.resolution = (256, 256)
-        # self.fix_steps = steps
-
-        # self.mask_generator = get_mask_generator()
-        
+        self.internal_states = []
+        self.callback_on_internal_states = callback_on_internal_states
+        self.whole_workspace = whole_workspace
        
-        self.save_dir = '{}/agent_data/{}-{}-{}-{}'.\
-            format(self.save_dir, task, agent.name, config_name, checkpoint)
+        # self.save_dir = '{}/agent_data/{}-{}-{}-{}'.\
+        #     format(self.save_dir, self.task, agent.name, config_name, checkpoint)
 
-        os.makedirs(self.save_dir, exist_ok=True)
-        # self.step = -1
-        # self.last_action = None
-        # self.trj_name = ''
-        # self.adjust_pick = adjust_pick
-        # self.adjust_orient = adjust_orien
+        #os.makedirs(self.save_dir, exist_ok=True)
 
         self.depth_sim2real = depth_sim2real
         self.mask_sim2real = mask_sim2real
         self.sim_camera_height = sim_camera_height
 
-        print('Finish Init Agent')
+        print('Finish Initialising Agent')
 
     def save_step(self, state):
         super().save_step(state)
@@ -93,70 +79,146 @@ class AgentArenaInterface(ControlInterface):
             cv2.imwrite('{}/place-heat.png'.format(save_dir,self.step), pick_heat)
             cv2.imwrite('tmp/place-heat.png', pick_heat)
     
+    def end_trial(self, state):
+        if self.callback_on_internal_states is not None:
+            self.callback_on_internal_states(self.internal_states, os.path.join(self.save_dir, self.trj_name))
+        return super().end_trial(state)
+    
     def act(self, state):
         mask = state['observation']['mask']
+        state['arena_id'] = 0
         height, width = mask.shape[:2]
-        pnp = self.agent.act(state).reshape(4)
+        action = self.agent.act([state])[0]
+        self.internal_states.append(self.agent.get_state()[0])
+        if self.debug:
+            print('inter states keys', self.agent.get_state()[0].keys())
+        if 'norm-pixel-pick-and-place' in action:
+            action = action['norm-pixel-pick-and-place']
+        pnp = np.concatenate([action['pick_0'][::-1], action['place_0'][::-1]]).reshape(4)
         orientation = 0.0
-        pick_pixel = ((pnp[:2] + 1)/2*height).clip(0, height-1).astype(np.int32)
-        
+        pick_pixel = ((pnp[:2]-0.0001 + 1)/2*np.asarray([width, height])).astype(np.int32)
+        org_pick = pick_pixel.copy()
         if self.adjust_pick:
-           
-            adjust_pick, errod_mask = adjust_points([pick_pixel], mask.copy())
+            adjust_pick, errod_mask = adjust_points([pick_pixel], mask.copy(), 5)
             pick_pixel = adjust_pick[0]
 
+        #print('adjust orient', self.adjust_orient)
         if self.adjust_orient:
-            if self.adjust_pick:
-                feed_mask = errod_mask
-            else:
-                feed_mask = mask
-            orientation = get_orientation(pick_pixel, feed_mask.copy())
-            print('orient', orientation)
+            # Determine which mask to use based on adjust_pick
+            feed_mask = errod_mask if self.adjust_pick else mask
 
-        pnp[:2] = np.asarray(pick_pixel, dtype=np.float32)/height * 2 - 1
+            # Get orientation of the pick point
+            orientation = get_orientation(pick_pixel, feed_mask.copy())
+
+            # Combine mask and feed_mask
+            mask_gray = mask.astype(np.float32) * 0.5
+            feed_mask_white = feed_mask.astype(np.float32) * 0.5
+            grasp_image = mask_gray + feed_mask_white
+
+            # Convert to 8-bit RGB image
+            grasp_image = (grasp_image * 255).clip(0, 255).astype(np.uint8)
+            grasp_image = cv2.cvtColor(grasp_image, cv2.COLOR_GRAY2RGB)
+            ## resize grasp image to make it bigger
+            grasp_image = cv2.resize(grasp_image, (width*2, height*2))
+            draw_pick_pixel = (np.asarray(pick_pixel) * 2).astype(np.int32)
+            org_pick = (org_pick * 2).astype(np.int32)
+
+           
+
+            # Draw orientation line (red)
+            orientation_rad = orientation * np.pi / 180
+            end_point = (
+                int(draw_pick_pixel[0] + 30 * np.cos(orientation_rad)),
+                int(draw_pick_pixel[1] + 30 * np.sin(orientation_rad))
+            )
+            start_point = (
+                int(draw_pick_pixel[0] - 30 * np.cos(orientation_rad)),
+                int(draw_pick_pixel[1] - 30 * np.sin(orientation_rad))
+            )
+            cv2.line(grasp_image, start_point, end_point, (255, 0, 0), 4)
+
+            cv2.circle(grasp_image, tuple(org_pick), 7, (144, 238, 144), -1)
+            cv2.circle(grasp_image, tuple(draw_pick_pixel), 7, (170, 51, 106), -1)
+
+            # Save the image in the agent's state
+            agent_state = self.agent.get_state()[0]
+            agent_state['grasp_image'] = grasp_image
+
+        pnp[:2] = np.asarray(pick_pixel, dtype=np.float32)/np.asarray([width, height]) * 2 - 1
 
         action = {
             'pick-and-place': pnp,
             'orientation': orientation
         }
 
-        print('action', action)
+        if self.debug:
+            print('action', action)
 
         return action
     
     def reset(self):
         super().reset()
-        self.agent.reset()
+        self.internal_states = []
+        self.agent.reset([0]) # arena id 0.
     
     def init(self, state):
-        self.agent.init(state)
+        state['arena_id'] = 0
+        self.agent.init([state])
+       
     
     def update(self, state, action):
-        self.agent.update(state, np.asarray(action['pick-and-place']))
+        state['arena_id'] = 0
+        self.agent.update([state], [np.asarray(action['pick-and-place'])])
+        if self.debug:
+            print('update states', self.agent.get_state()[0].keys())
+      
 
     def get_state(self):
-        return self.agent.get_state()
+        return self.agent.get_state()[0]
 
-    def post_process(self, rgb, depth, raw_rgb=None, pointcloud=None):
-        rgb = cv2.resize(rgb, self.resolution)
-        depth = cv2.resize(depth, self.resolution)
+    def post_process(self, rgb, depth, workspace, raw_rgb=None, pointcloud=None):
+        # rgb = cv2.resize(rgb, self.resolution)
+        # depth = cv2.resize(depth, self.resolution)
         if self.mask_sim2real == 'v2':
-            mask = get_mask_v2(self.mask_generator, rgb)
+            mask = get_mask_v2(self.mask_generator, rgb, mask_treshold=MASK_THRESHOLD_V2)
 
         rgb =  cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
 
-        ### Alert !!! map the depth from 0 (shallowest) to 1 (deepest)
-        ### background are 1s.
-        ### the agent needs to do the adjustment according! 
-        
         if self.depth_sim2real in ['v1', 'v2']:
-            norm_depth = (depth - np.min(depth))/((np.max(depth)) - np.min(depth))
-            masked_depth = norm_depth * mask
-            new_depth = np.ones_like(masked_depth)
-            depth = new_depth * (1 - mask) + masked_depth
-        
+            if len(mask.shape) == 2:
+                mask_ = np.expand_dims(mask, -1)
+            else:
+                mask_ = mask
+            
+            # Create boolean mask for indexing
+            bool_mask = mask_.astype(bool)
+            
+            # Extract only the masked region
+            masked_region = depth[bool_mask]
+            
+            if masked_region.size > 0:  # Check if mask is not empty
+                sort_masked_region = np.sort(masked_region.flatten())
+                min_val = sort_masked_region[10]
+                max_val = sort_masked_region[-10]
+                
+                if min_val == max_val:
+                    # Handle uniform values
+                    depth[bool_mask] = 0
+                else:
+                    # Normalize only the masked region
+                    depth[bool_mask] = (masked_region - min_val) / (max_val - min_val)
+                    depth[depth < 0] = 0
+                    depth[depth > 1] = 1
+                    # depth[bool_mask] -= 0.005
+                    # depth[depth < 0] = 0
+            new_depth = np.ones_like(depth)
+            depth = new_depth * (1 - mask_) + depth
+                
         elif self.depth_sim2real == 'v0':
             depth += (self.sim_camera_height - self.real_camera_height)
+            masked_depth = depth * mask
+            new_depth = np.ones_like(masked_depth) * self.sim_camera_height
+            depth = new_depth * (1 - mask) + masked_depth
 
         
         # save_depth(new_depth, filename='post_depth.png', directory="./tmp")
@@ -167,19 +229,29 @@ class AgentArenaInterface(ControlInterface):
             'observation': {
                 'rgb': rgb.copy(),
                 'depth': depth.copy(),
-                'mask': mask.copy()
+                'mask': mask.copy(),
+                'workspace_mask': workspace.copy()[:, :, 0],
             },
             'action_space': Box(
                 -np.ones((1, 4)).astype(np.float32),
                 np.ones((1, 4)).astype(np.float32),
                 dtype=np.float32),
             'sim2real': True,
-            'task': self.task
+            'task': self.task,
         }
 
-        if raw_rgb is not None:
+        #if self.goal_conditioned and self.step != -1:
+        
+        
+        # for k, v in state['goal'].items():
+        #     state['observation'][f"goal-{k}"] = v
+
+        if self.whole_workspace:
+            state['observation']['full_mask'] = mask
+            state['observation']['raw_rgb'] = rgb
+        elif raw_rgb is not None:
             raw_rgb = raw_rgb[100:-100, 150:-150]
-            full_mask = get_mask_v2(self.mask_generator, raw_rgb)[10:-10, 10:-10]
+            full_mask = get_mask_v2(self.mask_generator, raw_rgb, mask_treshold=MASK_THRESHOLD_V2)[10:-10, 10:-10]
             state['observation']['full_mask'] = full_mask
             raw_rgb =  cv2.cvtColor(raw_rgb[10:-10, 10:-10], cv2.COLOR_BGR2RGB)
             state['observation']['raw_rgb'] = raw_rgb
@@ -222,7 +294,7 @@ if __name__ == "__main__":
     print('Initialise Agent ...')
     if args.task == 'flattening':
         #domain = 'sim2real-rect-fabric'
-        initial = 'crumple'
+        initial = 'crumpled'
     elif args.task in ['double-side-folding', 'rectangular-folding']:
         #domain = 'sim2real-rect-fabric'
         initial = 'flatten'
@@ -247,12 +319,13 @@ if __name__ == "__main__":
     agent_config = agar.retrieve_config(
         args.agent, 
         arena, 
-        args.config,
-        args.log_dir)
+        args.config)
     
     agent = agar.build_agent(
         args.agent,
         config=agent_config)
+    log_dir = os.path.join(args.log_dir, arena, args.agent, args.config)
+    agent.set_log_dir(log_dir)
 
     if args.eval_checkpoint == -1:
         checkpoint = agent.load()
@@ -266,8 +339,9 @@ if __name__ == "__main__":
         
         ### Run Sim2Real ###
         sim2real = AgentArenaInterface(
-            agent, args.task, args.config, 
-            checkpoint, max_steps, 
+            agent, args.config, 
+            checkpoint, max_steps,
+            task=args.task, 
             adjust_orien=args.adjust_orien, 
             adjust_pick=args.adjust_pick, 
             save_dir=args.save_dir,

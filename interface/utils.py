@@ -2,6 +2,7 @@ import time
 import select
 import sys
 
+import matplotlib.pyplot as plt
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 import pyrealsense2 as rs
@@ -19,7 +20,8 @@ import torch
 import signal
 from segment_anything import SamPredictor, sam_model_registry, SamAutomaticMaskGenerator
 from segment_anything import sam_model_registry
-from agent_arena.utilities.visualisation_utils import draw_pick_and_place, filter_small_masks
+from agent_arena.utilities.visual_utils \
+    import draw_pick_and_place, filter_small_masks
 
 import subprocess
 import shlex
@@ -28,6 +30,118 @@ from skimage.measure import label, regionprops
 
 MyPos = namedtuple('Pos', ['pose', 'orien'])
 
+MASK_THRESHOLD_V2=350000
+
+def extract_square_crop_mask(mask):
+    coords = np.argwhere(mask)
+    y_center, x_center = coords.mean(axis=0).astype(int)
+    side_length = min(mask.shape)
+    x_start = max(x_center - side_length // 2, 0)
+    y_start = max(y_center - side_length // 2, 0)
+    x_start = min(x_start, mask.shape[1] - side_length)
+    y_start = min(y_start, mask.shape[0] - side_length)
+    return mask[y_start: y_start + side_length, x_start: x_start + side_length]
+    #return (y_start, , x_start, x_start + side_length)
+
+def calculate_iou(mask1, mask2):
+    if mask1.shape[0] > 128:
+        mask1 = cv2.resize(mask1.astype(np.float32), (128, 128), interpolation=cv2.INTER_AREA)
+        mask1 = (mask1 > 0.5).astype(bool)
+        
+
+    if mask2.shape[0] > 128:
+        mask2 = cv2.resize(mask2.astype(np.float32), (128, 128), interpolation=cv2.INTER_AREA)
+        mask2 = (mask2 > 0.5).astype(bool)
+
+    intersection = np.logical_and(mask1, mask2).sum()
+    union = np.logical_or(mask1, mask2).sum()
+    return intersection / union if union > 0 else 0
+
+def get_max_IoU(mask1, mask2):
+    """
+    Calculate the maximum IoU between two binary mask images,
+    allowing for rotation and translation of mask1.
+    
+    :param mask1: First binary mask (numpy array)
+    :param mask2: Second binary mask (numpy array)
+    :return: Tuple of (Maximum IoU value, Matched mask)
+    """
+
+    ## if mask is rectangular, make it square by padding
+    if mask1.shape[0] > mask1.shape[1]:
+        pad = (mask1.shape[0] - mask1.shape[1]) // 2
+        mask1 = np.pad(mask1, ((0, 0), (pad, pad)), mode='constant')
+    elif mask1.shape[1] > mask1.shape[0]:
+        pad = (mask1.shape[1] - mask1.shape[0]) // 2
+        mask1 = np.pad(mask1, ((pad, pad), (0, 0)), mode='constant')
+    
+    if mask2.shape[0] > mask2.shape[1]:
+        pad = (mask2.shape[0] - mask2.shape[1]) // 2
+        mask2 = np.pad(mask2, ((0, 0), (pad, pad)), mode='constant')
+    elif mask2.shape[1] > mask2.shape[0]:
+        pad = (mask2.shape[1] - mask2.shape[0]) // 2
+        mask2 = np.pad(mask2, ((pad, pad), (0, 0)), mode='constant')
+    
+    # print('mask1 shape:', mask1.shape)
+    # print('mask2 shape:', mask2.shape)
+
+    # if resolution above 128, we need to resize the mask to 128
+    if mask1.shape[0] > 128:
+        mask1 = cv2.resize(mask1.astype(np.float32), (128, 128), interpolation=cv2.INTER_AREA)
+        mask1 = (mask1 > 0.5).astype(np.uint8)
+        
+
+    if mask2.shape[0] > 128:
+        mask2 = cv2.resize(mask2.astype(np.float32), (128, 128), interpolation=cv2.INTER_AREA)
+        mask2 = (mask2 > 0.5).astype(np.uint8)
+    
+    
+
+    # Get the properties of mask2
+    props = regionprops(label(mask2))[0]
+    center_y, center_x = props.centroid
+
+    max_iou = 0
+    best_mask = None
+    
+    # Define rotation angles to try
+    angles = range(0, 360, 1)  # Rotate from 0 to 350 degrees in 10-degree steps
+    
+    for angle in angles:
+        # Rotate mask1
+        rotated_mask = rotate(mask1, angle, reshape=False)
+
+        # if the mask is blank, skip
+        if np.sum(rotated_mask) == 0:
+            continue
+        
+        # Get properties of rotated mask
+        rotated_props = regionprops(label(rotated_mask))[0]
+        rotated_center_y, rotated_center_x = rotated_props.centroid
+        
+        # Calculate translation
+        dy = center_y - rotated_center_y
+        dx = center_x - rotated_center_x
+        
+        # Translate rotated mask
+        translated_mask = shift(rotated_mask, (dy, dx))
+        
+        #translated_mask = (translated_mask > 0.1).astype(int)
+        # Calculate IoU
+        iou = calculate_iou(translated_mask, mask2)
+        
+        # Update max_iou and best_mask if necessary
+        if iou > max_iou:
+            max_iou = iou
+            best_mask = translated_mask
+
+    # Ensure the best_mask is binary
+    if best_mask is None:
+        return 0, None
+    
+    best_mask = (best_mask > 0.5).astype(int)
+
+    return max_iou, best_mask
 
 def get_IoU(mask1, mask2):
     """
@@ -82,7 +196,7 @@ def get_IoU(mask1, mask2):
 
     return max_iou, best_mask
 
-def get_mask_v2(mask_generator, rgb):
+def get_mask_v2(mask_generator, rgb, mask_treshold=160000):
         """
         Generate a mask for the given RGB image that is most different from the background.
         
@@ -97,8 +211,8 @@ def get_mask_v2(mask_generator, rgb):
         
         final_mask = None
         max_color_difference = 0
-        print('Processing mask results...')
-        save_color(rgb, 'rgb')
+        #print('Processing mask results...')
+        save_color(rgb, 'rgb', './tmp')
         mask_data = []
 
         # Iterate over each generated mask result
@@ -107,7 +221,7 @@ def get_mask_v2(mask_generator, rgb):
             mask_shape = rgb.shape[:2]
 
             ## count no mask corner of the mask
-            margin = 5
+            margin = 5 #5
             mask_corner_value = 1.0*segmentation_mask[margin, margin] + 1.0*segmentation_mask[margin, -margin] + \
                                 1.0*segmentation_mask[-margin, margin] + 1.0*segmentation_mask[-margin, -margin]
             
@@ -140,11 +254,16 @@ def get_mask_v2(mask_generator, rgb):
             #save_mask(orginal_mask, f'mask_candidate_{i}')
             
             # Select the mask with the maximum color difference from the background
-            mask_region_size = np.sum(segmentation_mask == 255)
+            #mask_region_size = np.sum(segmentation_mask == 255)
+            
 
             if mask_corner_value >= 2:
                 # if the mask has more than 2 corners, the flip the value
                 orginal_mask = 1 - orginal_mask
+            
+            mask_region_size = np.sum(orginal_mask == 1)
+            if mask_region_size > mask_treshold:
+                continue
 
             mask_data.append({
                 'mask': orginal_mask,
@@ -152,14 +271,117 @@ def get_mask_v2(mask_generator, rgb):
                 'mask_region_size': mask_region_size,
             })
         
-        top_5_masks = sorted(mask_data, key=lambda x: x['color_difference'], reverse=True)[:5]
+        top_num = 3
+        top_5_masks = sorted(mask_data, key=lambda x: x['color_difference'], reverse=True)[:top_num]
         final_mask_data = sorted(top_5_masks, key=lambda x: x['mask_region_size'], reverse=True)[0]
         final_mask = final_mask_data['mask']
+
+        ## make the margine of the final mask to be 0
+        margin = 5
+        final_mask[:margin, :] = 0
+        final_mask[-margin:, :] = 0
+        final_mask[:, :margin] = 0
+        final_mask[:, -margin:] = 0
+
+        ## print the average color of the mask background
+        masked_region = np.expand_dims(final_mask, -1) * rgb
+        background_region = (1 - np.expand_dims(final_mask, -1)) * rgb
+        masked_pixels = masked_region[final_mask == 1]
+        avg_masked_color = np.mean(masked_pixels, axis=0)
+        background_pixels = background_region[final_mask == 0]
+        avg_background_color = np.mean(background_pixels, axis=0)
+        #print(f'avg_masked_color {avg_masked_color} avg_background_color {avg_background_color}')
         
         #save_mask(final_mask, 'final_mask')
-        print('Final mask generated.')
+        #print('Final mask generated.')
 
         return final_mask
+
+def get_mask_v1(mask_generator, rgb):
+    ## similar as get_mask_v2, but only get the top_1 mask
+    results = mask_generator.generate(rgb)
+        
+    final_mask = None
+    max_color_difference = 0
+    #print('Processing mask results...')
+    save_color(rgb, 'rgb', './tmp')
+    mask_data = []
+
+    # Iterate over each generated mask result
+    for i, result in enumerate(results):
+        segmentation_mask = result['segmentation']
+        mask_shape = rgb.shape[:2]
+
+        ## count no mask corner of the mask
+        margin = 5
+        mask_corner_value = 1.0*segmentation_mask[margin, margin] + 1.0*segmentation_mask[margin, -margin] + \
+                            1.0*segmentation_mask[-margin, margin] + 1.0*segmentation_mask[-margin, -margin]
+        
+        
+
+        #print('mask corner value', mask_corner_value)
+        # Ensure the mask is in the correct format
+        orginal_mask = segmentation_mask.copy()
+        segmentation_mask = segmentation_mask.astype(np.uint8) * 255
+        
+        # Calculate the masked region and the background region
+        masked_region = cv2.bitwise_and(rgb, rgb, mask=segmentation_mask)
+        background_region = cv2.bitwise_and(rgb, rgb, mask=cv2.bitwise_not(segmentation_mask))
+        
+        # Calculate the average color of the masked region
+        masked_pixels = masked_region[segmentation_mask == 255]
+        if masked_pixels.size == 0:
+            continue
+        avg_masked_color = np.mean(masked_pixels, axis=0)
+        
+        # Calculate the average color of the background region
+        background_pixels = background_region[segmentation_mask == 0]
+        if background_pixels.size == 0:
+            continue
+        avg_background_color = np.mean(background_pixels, axis=0)
+        
+        # Calculate the Euclidean distance between the average colors
+        color_difference = np.linalg.norm(avg_masked_color - avg_background_color)
+        #print(f'color difference {i} color_difference {color_difference}')
+        #save_mask(orginal_mask, f'mask_candidate_{i}')
+        
+        # Select the mask with the maximum color difference from the background
+        #mask_region_size = np.sum(segmentation_mask == 255)
+        
+
+        if mask_corner_value >= 2:
+            # if the mask has more than 2 corners, the flip the value
+            orginal_mask = 1 - orginal_mask
+        
+        mask_region_size = np.sum(orginal_mask == 1)
+        if mask_region_size > 160000:
+            continue
+
+        mask_data.append({
+            'mask': orginal_mask,
+            'color_difference': color_difference,
+            'mask_region_size': mask_region_size,
+        })
+    
+    final_mask = sorted(mask_data, key=lambda x: x['color_difference'], reverse=True)[0]['mask']
+    
+    #save_mask(final_mask, 'final_mask')
+    print('Final mask generated.')
+
+    return final_mask
+
+def get_mask_v0(rgb):
+    ### segment the region that is under the threshold
+    ## rgb in shape H, W, 3
+
+    threshold = [105, 105, 105]
+    mask = np.ones((rgb.shape[0], rgb.shape[1]))
+    for i in range(rgb.shape[0]):
+        for j in range(rgb.shape[1]):
+            if np.all(rgb[i, j] < threshold):
+                mask[i, j] = 0
+    return mask
+
 
 def start_ffmpeg_recording(output_file, device='/dev/video6', resolution='1920x1080', framerate=30):
     """
@@ -206,33 +428,98 @@ def get_mask_generator():
 
     ### Masking Model Macros ###
     MODEL_TYPE = "vit_h"
-    sam = sam_model_registry[MODEL_TYPE](checkpoint='sam_vit_h_4b8939.pth')
+    sam = sam_model_registry[MODEL_TYPE](
+        checkpoint=os.path.join(
+            os.environ['ROBOT_CONTROL_CLOTH_DIR'], 'interface', 'sam_vit_h_4b8939.pth'))
+
     sam.to(device=DEVICE)
     return SamAutomaticMaskGenerator(sam)
 
 
-def get_orientation(point, mask):
+# def get_orientation(point, mask):
+#     mask = (mask > 0).astype(np.uint8)
+    
+#     # Compute gradients
+#     grad_y = sobel(mask, axis=0)
+#     grad_x = sobel(mask, axis=1)
+    
+#     x, y = point
+    
+#     # Calculate orientation
+#     gx = grad_x[y, x]
+#     gy = grad_y[y, x]
+#     orientation_rad = np.arctan2(gy, gx)
+    
+#     # Convert orientation to degrees
+#     orientation_deg = np.degrees(orientation_rad)
+    
+#     # Normalize to range [0, 360)
+#     orientation_deg = (orientation_deg - 90 + 360) % 360
+    
+#     return orientation_deg
+
+def get_orientation(point, mask, window_size=21):
+    # Ensure mask is binary
     mask = (mask > 0).astype(np.uint8)
     
-    # Compute gradients
-    grad_y = sobel(mask, axis=0)
-    grad_x = sobel(mask, axis=1)
-    
+    # Extract a window around the point
     x, y = point
+    half_window = window_size // 2
+    window = mask[max(0, y-half_window):min(mask.shape[0], y+half_window+1),
+                  max(0, x-half_window):min(mask.shape[1], x+half_window+1)]
+    
+    # Compute gradients
+    grad_y = sobel(window, axis=0)
+    grad_x = sobel(window, axis=1)
+
+    if np.all(grad_x == 0) and np.all(grad_y == 0):
+        return 0.0  # Return 0 degrees if no gradient
+    
+    # Compute orientation using Principal Component Analysis (PCA)
+    cov = np.cov(np.array([grad_x.ravel(), grad_y.ravel()]))
+    eigenvalues, eigenvectors = np.linalg.eig(cov)
+    
+    # The eigenvector corresponding to the smaller eigenvalue 
+    # gives the direction perpendicular to the dominant edge
+    idx = eigenvalues.argsort()[::-1]
+    eigenvectors = eigenvectors[:, idx]
     
     # Calculate orientation
-    gx = grad_x[y, x]
-    gy = grad_y[y, x]
-    orientation_rad = np.arctan2(gy, gx)
+    orientation_rad = np.arctan2(eigenvectors[1, 1], eigenvectors[0, 1])
     
     # Convert orientation to degrees
     orientation_deg = np.degrees(orientation_rad)
     
     # Normalize to range [0, 360)
-    orientation_deg = (orientation_deg - 90 + 360) % 360
+    orientation_deg = (orientation_deg + 360) % 360 - 180
     
     return orientation_deg
 
+def refine_orientation(point, mask, initial_orientation, refinement_angle=10, num_steps=21):
+    x, y = point
+    best_orientation = initial_orientation
+    max_sum = 0
+    
+    for angle in np.linspace(initial_orientation - refinement_angle, 
+                             initial_orientation + refinement_angle, num_steps):
+        line_points = get_line_points(point, angle, length=20)
+        line_sum = sum(mask[py, px] for px, py in line_points if 0 <= py < mask.shape[0] and 0 <= px < mask.shape[1])
+        
+        if line_sum > max_sum:
+            max_sum = line_sum
+            best_orientation = angle
+    
+    return best_orientation
+
+def get_line_points(start, angle, length):
+    x, y = start
+    rad = np.radians(angle)
+    return [(int(x + i * np.cos(rad)), int(y + i * np.sin(rad))) for i in range(length)]
+
+def improved_get_orientation(point, mask):
+    initial_orientation = get_orientation(point, mask)
+    refined_orientation = refine_orientation(point, mask, initial_orientation)
+    return refined_orientation
 
 def stop_ffmpeg_recording(process):
     """
@@ -338,20 +625,58 @@ def imgmsg_to_cv2_custom(img_msg, encoding="bgr8"):
         image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     elif encoding == "mono8":
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    elif encoding == "8UC1":
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
     return image
 
 def save_color(img, filename='color', directory="."):
+    #print('save color img' , img.shape)
     img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     cv2.imwrite('{}/{}.png'.format(directory, filename), img_bgr)
 
-def save_depth(depth, filename='depth', directory=".", colour=False):
-    depth = (depth - np.min(depth))/(np.max(depth) - np.min(depth))
+def save_depth(depth, filename='depth', directory=".", colour=False, remap=True):
+    if remap:
+        depth = (depth - np.min(depth))/(np.max(depth) - np.min(depth))
+    
     if colour:
         depth = cv2.applyColorMap(np.uint8(255 * depth), cv2.COLORMAP_JET)
     else:
         depth = np.uint8(255 * depth)
+    
     cv2.imwrite('{}/{}.png'.format(directory, filename), depth)
+
+def save_depth_distribution(depth_image, filename='depth_distribution', directory="."):
+    """
+    Saves a histogram of depth values from a depth image to a PNG file.
+
+    Parameters:
+        depth_image (numpy.ndarray): A 2D array representing the depth image.
+        filename (str): The name of the output file (without extension). Default is 'depth_distribution'.
+        directory (str): The directory where the file will be saved. Default is the current directory (".").
+    """
+    # Ensure the directory exists
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    
+    # Compute histogram with 100 bins
+    depth_image = depth_image.flatten()
+    hist, bins = np.histogram(depth_image, bins=100)
+
+    
+    # Compute bin centers for better alignment in the bar plot
+    bin_centers = (bins[:-1] + bins[1:]) / 2
+    
+    # Plot and save histogram
+    plt.figure()
+    plt.bar(bin_centers, hist, width=np.diff(bins), align='center')
+    plt.xlabel('Depth Value')
+    plt.ylabel('Frequency')
+    plt.yscale('log')
+    plt.title('Depth Distribution')
+    plt.savefig(f'{directory}/{filename}.png')
+    plt.close()
+
 
 def save_mask(mask, filename='mask', directory="."):
     mask = mask.astype(np.int8)*255

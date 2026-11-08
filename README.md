@@ -55,10 +55,12 @@ colcon build --base-paths ../
 
 1. Lauch UR driver
 ```
-source /opt/ros/humble/setup.bash
+source /opt/ros/humble/setup.sh
 
 ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur3e robot_ip:=192.168.1.15 launch_rviz:=false
 ```
+
+The above needs to be run first, otherwise the pedant will complain about the connection.
 
 2. Run the `URCaps` program in pedant, and set to `remote control`.
 
@@ -74,33 +76,21 @@ ros2 launch rcc_qs_pnp \
     planner:=ompl
 ```
 
-4. Run either of the following option to generate pick-and-place policy
-    
-    a. Human interace
-    ```
-    source /opt/ros/humble/setup.bash
-    source <path-to-workspace>rcc_build/install/setup.sh
-    
-    ros2 run rcc_qs_pnp human_interface.py
-    ```
-
-    b. Following the [`agent-arena`'s ROS2 `Humble` setup]() for autimatically generate pick-and-place policy.
-
-
 ## IV. Test Individual Components
 
 1. Test ur3e robot with moveit
+Right under `<ws_name>`
 ```
 source /opt/ros/humble/setup.bash
-source <path-to-workspace>/rcc_build/install/setup.sh
+source ./rcc_build/install/setup.sh
 
-ros2 launch rcc_qs_pnp ur_robot_moveit_executable_launch.py ur_type:=ur3e executable:ur3e_robot_moveit.py
+ros2 launch rcc_qs_pnp ur_robot_moveit_executable_launch.py ur_type:=ur3e executable:=ur3e_robot_moveit.py
 ```
 
 2. Test active gripper
 ```
 source /opt/ros/humble/setup.bash
-source <path-to-workspace>rcc_build/install/setup.sh
+source ./rcc_build/install/setup.sh
 
 ros2 run rcc_qs_pnp active_gripper_control.py
 ```
@@ -113,12 +103,20 @@ source ./rcc_build/install/setup.sh
 ros2 launch rcc_qs_pnp ur_robot_moveit_executable_launch.py ur_type:=ur3e executable:=test_whole_system.py
 ```
 
+5. Hand-Eye calibration
+
+```
+source /opt/ros/humble/setup.bash
+source ./rcc_build/install/setup.sh
+
+ros2 launch rcc_qs_pnp ur_robot_moveit_executable_launch.py ur_type:=ur3e executable:=hand_eye_calibrator.py
+```
+
 ## V. Build and Run integration with `agent-arena`
 1. Build
 ```
 cd <path-to-agent-arena>
 . ./setup.sh
-source $CONDA_PREFIX/setup.bash
 ```
 
 ```
@@ -134,8 +132,11 @@ source install/setup.sh
 ```
 cd <path-to-agent-arena>
 . ./setup.sh
-source $CONDA_PREFIX/setup.bash
-source <path-to-workspace>/agar_build/install/setup.sh
+```
+
+Go to the workspace
+```
+source ./agar_build/install/setup.sh
 ```
 
 a. human_interace
@@ -162,4 +163,16 @@ pkill -SIGINT ffmpeg
 
 ```
 python agent_arena_interface.py --agent foldsformer --domain ffmr-square-fabric --adjust_pick --adjust_orien --depth_sim2real v0 --mask_sim2real v2 --task all-corner-inward-folding --config default
+```
+
+## VI. Run JA-TN
+```
+python agent_arena_interface.py --agent transporter --domain sim2real-square-fabric --adjust_pick --adjust_orien --depth_sim2real v2 --mask_sim2real v2 --task all-corner-inward-folding --config MJ-TN-1000-rgb-maskout-rotation-90
+
+```
+
+## VI. Run Diffusion
+```
+python agent_arena_interface.py --agent diffusion_policy --domain real2sim-towels --adjust_pick --adjust_orien --depth_sim2real v2 --mask_sim2real v2 --task flattening --config masked-rgb
+
 ```
