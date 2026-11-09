@@ -30,9 +30,12 @@ Install ros-humble-moveit-py
 apt-get upgrade 
 ```
 
-4. Install Need Python Pacakages
+4. Install the Python packages, pinned, from [`actoris_harena`](https://github.com/st-cortex-lab/actoris_harena)
+   (`main` branch, checked out beside this workspace). The interface imports `actoris_harena`
+   itself; ROS 2 stays the apt install above.
 ```
-pip install dotmap
+pip install -r <path-to-actoris_harena>/requirements/draper.txt
+pip install -e <path-to-actoris_harena> --no-deps
 ```
 
 5. Build a workspace
@@ -112,11 +115,11 @@ source ./rcc_build/install/setup.sh
 ros2 launch rcc_qs_pnp ur_robot_moveit_executable_launch.py ur_type:=ur3e executable:=hand_eye_calibrator.py
 ```
 
-## V. Build and Run integration with `agent-arena`
+## V. Build and Run integration with `actoris_harena`
 1. Build
 ```
-cd <path-to-agent-arena>
-. ./setup.sh
+cd <path-to-actoris_harena>
+ACTORIS_HARENA_CONDA_ENV=<the environment from step I.4> . ./env_setup.sh
 ```
 
 ```
@@ -127,11 +130,11 @@ colcon build --packages-select rcc_msgs --base-paths ../
 source install/setup.sh
 ```
 
-2. Run `agent-arena` scripts for sending policies to robot
+2. Run `actoris_harena` policies on the robot
 
 ```
-cd <path-to-agent-arena>
-. ./setup.sh
+cd <path-to-actoris_harena>
+ACTORIS_HARENA_CONDA_ENV=<the environment from step I.4> . ./env_setup.sh
 ```
 
 Go to the workspace

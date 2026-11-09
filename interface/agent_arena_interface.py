@@ -13,17 +13,23 @@ import traceback
 import rclpy
 from rclpy.node import Node
 
-import agent_arena as agar
+import actoris_harena as agar
 
 
 from rcc_msgs.msg import NormPixelPnP, Observation
 from std_msgs.msg import Header
-from agent_arena.utilities.visual_utils import *
+from actoris_harena.utilities.visual_utils import *
 
 import argparse
 from cv_bridge import CvBridge, CvBridgeError
-from .utils import *
-from .control_interface import ControlInterface
+# Imported as a package (<workspace>.interface.<module>, as LaGarNet's
+# ur3e_control.py does) or run as a script from this directory (README).
+try:
+    from .utils import *
+    from .control_interface import ControlInterface
+except ImportError:
+    from utils import *
+    from control_interface import ControlInterface
 
 
 class AgentArenaInterface(ControlInterface):
@@ -92,9 +98,12 @@ class AgentArenaInterface(ControlInterface):
         self.internal_states.append(self.agent.get_state()[0])
         if self.debug:
             print('inter states keys', self.agent.get_state()[0].keys())
-        if 'norm-pixel-pick-and-place' in action:
+        if isinstance(action, dict) and 'norm-pixel-pick-and-place' in action:
             action = action['norm-pixel-pick-and-place']
-        pnp = np.concatenate([action['pick_0'][::-1], action['place_0'][::-1]]).reshape(4)
+        if isinstance(action, dict):
+            pnp = np.concatenate([action['pick_0'][::-1], action['place_0'][::-1]]).reshape(4)
+        else:  # the transporter adapters return this flat order already
+            pnp = np.asarray(action).reshape(4)
         orientation = 0.0
         pick_pixel = ((pnp[:2]-0.0001 + 1)/2*np.asarray([width, height])).astype(np.int32)
         org_pick = pick_pixel.copy()

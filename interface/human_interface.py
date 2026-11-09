@@ -12,9 +12,14 @@ from std_msgs.msg import Header
 from cv_bridge import CvBridge
 
 
-from utils import *
-
-from control_interface import ControlInterface
+# Imported as a package (<workspace>.interface.<module>, as LaGarNet's
+# ur3e_control.py does) or run as a script from this directory (README).
+try:
+    from .utils import *
+    from .control_interface import ControlInterface
+except ImportError:
+    from utils import *
+    from control_interface import ControlInterface
 
 
 class HumanPickAndPlace(ControlInterface):

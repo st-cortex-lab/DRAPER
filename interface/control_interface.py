@@ -13,7 +13,12 @@ from std_msgs.msg import Header
 from cv_bridge import CvBridge
 
 
-from .utils import *
+# Imported as a package (<workspace>.interface.<module>, as LaGarNet's
+# ur3e_control.py does) or run as a script from this directory (README).
+try:
+    from .utils import *
+except ImportError:
+    from utils import *
 
 class ControlInterface(Node):
     def __init__(self, task, steps=20, name='control_interface',
@@ -166,7 +171,7 @@ class ControlInterface(Node):
             save_color(noise_actions_obs_depth, filename='noise_actions_obs_depth', directory=save_dir)
 
         if 'denoise_depth_frames' in state:
-            from agent_arena.utilities.visual_utils import save_numpy_as_gif
+            from actoris_harena.utilities.visual_utils import save_numpy_as_gif
             file_dir = os.path.join(save_dir, 'denoise_depth_frames')
             save_numpy_as_gif(state['denoise_depth_frames'], file_dir)
             #save_frames(, directory=save_dir, filename='denoise_depth_frames')

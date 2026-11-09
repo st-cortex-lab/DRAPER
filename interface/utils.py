@@ -20,7 +20,7 @@ import torch
 import signal
 from segment_anything import SamPredictor, sam_model_registry, SamAutomaticMaskGenerator
 from segment_anything import sam_model_registry
-from agent_arena.utilities.visual_utils \
+from actoris_harena.utilities.visual_utils \
     import draw_pick_and_place, filter_small_masks
 
 import subprocess
